@@ -27,7 +27,7 @@ def handle_message(data, price_analyzer, session):
                 # Получаем текущую цену ETHUSDT
                 current_btc_price = price_analyzer.btc_prices[-1] if price_analyzer.btc_prices else None
                 if price_analyzer.should_record_eth_price(price, current_btc_price):
-                    print(f"сохраненная цена ETH {price}")
+
                     save_price_to_db(session, price)  # Запись цены в БД
             elif symbol == "btcusdt":
                 # Обновляем цену BTCUSDT
