@@ -1,44 +1,28 @@
 import os
+import logging
+import asyncio
 from dotenv import load_dotenv
-from app.database import setup_database, get_session, clear_old_prices, save_price_to_db
-from app.websocket_client import BinanceWebSocket
-from app.price_analyzer import PriceAnalyzer
+from app.database import setup_database, get_session, save_price_to_db
+from app.price_analyzer import PriceProcessor
+from app.wb import listenBinanceStreams
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
 
-def check_database_connection(database_url):
+def check_database_connection(database_url: str):
     """Проверка подключения к базе данных."""
     try:
         engine = setup_database(database_url)
         session = get_session(engine)
-        print("Подключение к базе данных успешно.")
+        logging.info("Подключение к базе данных успешно.")
         return session
     except Exception as e:
-        print(f"Ошибка подключения к базе данных: {e}")
+        logging.error(f"Ошибка подключения к базе данных: {e}")
         return None
 
 
-def handle_message(data, price_analyzer, session):
-    """Обработка входящего сообщения из веб-сокета."""
-    try:
-        if "s" in data:
-            symbol = data["s"].lower()
-            price = float(data["p"])
-            if symbol == "ethusdt":
-                # Получаем текущую цену ETHUSDT
-                current_btc_price = price_analyzer.btc_prices[-1] if price_analyzer.btc_prices else None
-                if price_analyzer.should_record_eth_price(price, current_btc_price):
-
-                    save_price_to_db(session, price)  # Запись цены в БД
-            elif symbol == "btcusdt":
-                # Обновляем цену BTCUSDT
-                print(f"цена BTC {price}")
-                price_analyzer.btc_prices.append(price)
-
-    except Exception:
-        pass  # Игнорируем ошибки
-
-
-def main():
+async def main():
     """Основная функция."""
     load_dotenv()
     database_url = os.getenv("DATABASE_URL")
@@ -49,32 +33,35 @@ def main():
     if session is None:
         return  # Если не удалось подключиться, завершаем выполнение
 
-    # Очистка старых данных перед началом работы
-    clear_old_prices(session)
-    price_analyzer = PriceAnalyzer()  # Инициализация анализатора цен
+    processor = PriceProcessor()  # Создаем экземпляр процессора цен
 
     # Запуск веб-сокета
-    websocket_client = BinanceWebSocket(lambda data: handle_message(data, price_analyzer, session))
-
-    # Получение цены ETH после начала работы веб-сокета
     try:
-        websocket_client.run()
-    except Exception:
-        pass  # Игнорируем ошибки
+        async for data in listenBinanceStreams():
+            symbol = data['s']  # Получаем символ
+            price = float(data['p'])  # Получаем цену и преобразуем в float
+            logging.info(f"Symbol: {symbol}, Price: {price}")  # Выводим символ и цену
+
+            # Добавляем цены в процессор
+            if symbol == "ETHUSDT":
+                processor.add_eth_price(price)
+            elif symbol == "BTCUSDT":
+                processor.add_btc_price(price)
+
+            # Обработка цен для исключения влияния BTC на ETH
+            processor.process_prices()
+            new_ETH_prices = processor.get_processed_prices()
+            logging.info(f"Новая цена ETH: {new_ETH_prices}")
+
+            # Сохраняем цену в БД
+            save_price_to_db(session, new_ETH_prices, symbol)
+
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
     finally:
-        # Вывод текущей цены ETH на момент завершения программы
-        final_price = price_analyzer.get_current_price()
-        # min_price = price_analyzer.check_price_change()
-        # max_price =
-
-        print(f"Цена ETH на момент завершения программы: {final_price}")
-        # print(f"Минимальная цена ETH за последний час: {min_price}")
-        # print(f"Максимальная цена ETH за последний час: {max_price}")
-
-        session.close()  # Закрытие сессии базы данных
+        session.close()  # Закрываем сессию базы данных
 
 
 if __name__ == "__main__":
-    print("Запуск программы...")
-    main()  # Запуск основной функции
-
+    logging.info("Запуск программы...")
+    asyncio.run(main())  # Запуск основной функции
