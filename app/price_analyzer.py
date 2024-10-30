@@ -1,60 +1,130 @@
-import numpy as np
-from sklearn.linear_model import LinearRegression
+import logging
+from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timedelta
+from sqlalchemy import func
+from app.models import Price, AdjustedPrice
 
 
-class PriceProcessor:
-    def __init__(self):
-        self.eth_prices = []
-        self.btc_prices = []
-        self.timestamp = []
+class EthPriceAnalyzer:
+    def __init__(self, db_manager):
+        self.db_manager = db_manager
 
-    def add_eth_price(self, price: float, timestamp: datetime = None) -> None:
-        """Добавление цены ETH в список."""
-        if timestamp is None:
-            timestamp = datetime.now()
-        self.eth_prices.append((timestamp, price))
-        self.remove_old_data(timestamp)
+    def analyze_price_influence(self, eth_symbol='ETHUSDT', btc_symbol='BTCUSDT', lookback_period=10):
+        """Анализирует влияние цены BTCUSDT на цену ETHUSDT за указанный период (в минутах)."""
+        session = self.db_manager.get_session()
+        try:
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=lookback_period)
 
-    def add_btc_price(self, price: float, timestamp: datetime = None) -> None:
-        """Добавление цены BTC в список."""
-        if timestamp is None:
-            timestamp = datetime.now()
-        self.btc_prices.append((timestamp, price))
-        self.remove_old_data(timestamp)
+            # Получаем данные цен ETH и BTC за указанный период
+            eth_prices = session.query(Price).filter(
+                Price.symbol == eth_symbol,
+                Price.timestamp >= start_time,
+                Price.timestamp <= end_time
+            ).all()
 
-    def remove_old_data(self, current_time: datetime) -> None:
-        """Удаление старых данных (старше 60 минут)."""
-        one_hour_ago = current_time - timedelta(hours=1)
-        self.eth_prices = [p for p in self.eth_prices if p[0] >= one_hour_ago]
-        self.btc_prices = [p for p in self.btc_prices if p[0] >= one_hour_ago]
+            btc_prices = session.query(Price).filter(
+                Price.symbol == btc_symbol,
+                Price.timestamp >= start_time,
+                Price.timestamp <= end_time
+            ).all()
 
-    def process_prices(self) -> None:
-        """Исключение влияния цены BTC на цену ETH."""
-        if len(self.eth_prices) < 2 or len(self.btc_prices) < 2:
-            return  # Недостаточно данных для анализа
+            if not eth_prices or not btc_prices:
+                logging.info("Недостаточно данных для анализа.")
+                return None
 
-        # Удаление цен с одинаковыми временными метками
-        unique_eth_prices = []
-        unique_btc_prices = []
-        eth_dict = {p[0]: p[1] for p in self.eth_prices}
-        btc_dict = {p[0]: p[1] for p in self.btc_prices}
+            # Извлекаем цены и временные метки
+            eth_data = [(price.timestamp, price.price) for price in eth_prices]
+            btc_data = [(price.timestamp, price.price) for price in btc_prices]
 
-        # Подготовка данных для линейной регрессии
-        eth_prices_array = np.array([price[1] for price in self.eth_prices]).reshape(-1, 1)
-        btc_prices_array = np.array([price[1] for price in self.btc_prices]).reshape(-1, 1)
+            # Объединяем данные по времени
+            combined_data = {}
+            for timestamp, price in eth_data:
+                combined_data[timestamp] = {'eth_price': price, 'btc_price': None}
+            for timestamp, price in btc_data:
+                if timestamp in combined_data:
+                    combined_data[timestamp]['btc_price'] = price
 
-        # Создание модели линейной регрессии
-        model = LinearRegression()
-        model.fit(btc_prices_array, eth_prices_array)
+            # Убираем записи, где отсутствует цена BTC
+            filtered_data = [(data['eth_price'], data['btc_price']) for data in combined_data.values() if
+                             data['btc_price'] is not None]
+            if not filtered_data:
+                logging.info("Нет совпадающих данных для анализа.")
+                return None
 
-        # Предсказание цен ETH на основе цен BTC
-        predicted_eth_prices = model.predict(btc_prices_array)
+            eth_prices, btc_prices = zip(*filtered_data)
 
-        # Удаление влияния BTC
-        self.eth_prices = [(timestamp, eth_price - predicted[0]) for (timestamp, eth_price), predicted in
-                           zip(self.eth_prices, predicted_eth_prices)]
+            # Вычисляем корреляцию
+            correlation = self.calculate_correlation(eth_prices, btc_prices)
+            logging.info(f"Корреляция между ценами {eth_symbol} и {btc_symbol}: {correlation:.2f}")
+            return correlation
 
-    def get_processed_prices(self):
-        """Получение обработанных цен ETH без влияния BTC."""
-        return [price for _, price in self.eth_prices]  # Возвращаем только цены
+        except Exception as e:
+            logging.error(f"Ошибка при анализе влияния цен: {e}")
+            return None
+        finally:
+            session.close()
+
+    @staticmethod
+    def calculate_correlation(x, y):
+        """Вычисляет корреляцию между двумя списками."""
+        if len(x) != len(y):
+            raise ValueError("Длины списков должны совпадать.")
+        n = len(x)
+        sum_x = sum(x)
+        sum_y = sum(y)
+        sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+        sum_x_squared = sum(xi ** 2 for xi in x)
+        sum_y_squared = sum(yi ** 2 for yi in y)
+
+        # Формула для вычисления корреляции
+        numerator = n * sum_xy - sum_x * sum_y
+        denominator = ((n * sum_x_squared - sum_x ** 2) * (n * sum_y_squared - sum_y ** 2)) ** 0.5
+        return numerator / denominator if denominator != 0 else 0  # Избегаем деления на ноль
+
+    def calculate_adjusted_eth_prices(self, eth_symbol='ETHUSDT', btc_symbol='BTCUSDT', lookback_period=10):
+        """Корректирует цены ETH на основе влияния цен BTC и сохраняет их в отдельной таблице."""
+        correlation = self.analyze_price_influence(eth_symbol, btc_symbol, lookback_period)
+        session = self.db_manager.get_session()
+
+        try:
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=lookback_period)
+
+            # Получаем данные цен ETH за указанный период
+            eth_prices = session.query(Price).filter(
+                Price.symbol == eth_symbol,
+                Price.timestamp >= start_time,
+                Price.timestamp <= end_time
+            ).all()
+
+            if not eth_prices:
+                logging.info("Недостаточно данных для анализа.")
+                return []
+
+            # Извлекаем цены ETH и их временные метки
+            adjusted_prices = []
+            for price in eth_prices:
+                if correlation is not None and abs(correlation) > 0.5:  # Условие для высокой корреляции
+                    adjusted_price = price.price * (1 - abs(correlation))  # Корректируем цену
+                else:
+                    adjusted_price = price.price  # Оставляем цену без изменений
+
+                # Добавляем скорректированную цену в список
+                adjusted_prices.append((price.timestamp, eth_symbol, adjusted_price))
+
+            # Записываем скорректированные цены в таблицу adjusted_prices
+            for timestamp, symbol, adjusted_price in adjusted_prices:
+                new_adjusted_price = AdjustedPrice(timestamp=timestamp, symbol=symbol, adjusted_price=adjusted_price)
+                session.add(new_adjusted_price)
+
+            session.commit()  # Сохраняем изменения
+            logging.info(f"Скорректированные цены ETH записаны в таблицу: {adjusted_prices}")
+            return adjusted_prices
+
+        except Exception as e:
+            logging.error(f"Ошибка при вычислении скорректированных цен ETH: {e}")
+            return []
+
+        finally:
+            session.close()

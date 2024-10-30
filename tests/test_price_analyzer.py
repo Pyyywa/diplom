@@ -1,50 +1,63 @@
 import unittest
-from datetime import datetime, timedelta
-from app.price_analyzer import PriceAnalyzer
+from unittest.mock import MagicMock, patch
+from app.models import DatabaseManager, Price  # Предполагаем, что эти классы уже существуют
+from app.price_analyzer import EthPriceAnalyzer
+from datetime import timedelta
 
-
-class TestPriceAnalyzer(unittest.TestCase):
+class TestEthPriceAnalyzer(unittest.TestCase):
     def setUp(self):
-        self.analyzer = PriceAnalyzer()
+        # Создаем поддельный экземпляр DatabaseManager
+        self.db_manager = MagicMock(spec=DatabaseManager)
+        self.eth_price_analyzer = EthPriceAnalyzer(self.db_manager)
 
-    def test_add_price(self):
-        self.analyzer.add_price(2000, 40000)
-        self.assertEqual(len(self.analyzer.eth_prices), 1)
-        self.assertEqual(len(self.analyzer.btc_prices), 1)
-        self.assertEqual(self.analyzer.eth_prices[0], 2000)
-        self.assertEqual(self.analyzer.btc_prices[0], 40000)
+    @patch('app.price_analyzer.datetime')
+    def test_analyze_price_influence(self, mock_datetime):
+        # Настраиваем mock для получения данных
+        mock_datetime.now.return_value = mock_datetime(2023, 10, 1, 12, 0, 0)
+        mock_datetime.timedelta = timedelta
 
-    def test_clean_old_prices(self):
-        # Добавляем цены с временными метками, которые будут очищены
-        self.analyzer.timestamps.append(datetime.now() - timedelta(minutes=61))
-        self.analyzer.eth_prices.append(2000)
-        self.analyzer.btc_prices.append(40000)
-        self.analyzer.clean_old_prices()
-        self.assertEqual(len(self.analyzer.eth_prices), 0)
-        self.assertEqual(len(self.analyzer.btc_prices), 0)
+        # Поддельные данные для ETH и BTC
+        self.db_manager.get_session.return_value.query.return_value.filter.return_value.all.side_effect = [
+            [Price(timestamp=mock_datetime(2023, 10, 1, 11, 59, 0), price=3000.0),
+             Price(timestamp=mock_datetime(2023, 10, 1, 12, 0, 0), price=3050.0)],
+            [Price(timestamp=mock_datetime(2023, 10, 1, 11, 59, 0), price=45000.0),
+             Price(timestamp=mock_datetime(2023, 10, 1, 12, 0, 0), price=45500.0)]
+        ]
 
-    def test_check_price_change(self):
-        # Добавляем цены для тестирования изменения
-        self.analyzer.add_price(2000, 40000)
-        self.analyzer.add_price(2020, 40500)
-        self.assertTrue(self.analyzer.check_price_change())  # Изменение > 1%
-        self.analyzer.add_price(2010, 40300)
-        self.assertFalse(self.analyzer.check_price_change())  # Изменение < 1%
+        correlation = self.eth_price_analyzer.analyze_price_influence(eth_symbol='ETHUSDT', btc_symbol='BTCUSDT',
+                                                                      lookback_period=60)
 
-    def test_should_record_eth_price(self):
-        self.analyzer.add_price(2000, 40000)
-        self.analyzer.add_price(2020, 40500)
-        self.analyzer.add_price(2010, 40300)
-        # Проверяем, что запись происходит при низкой корреляции
-        self.assertTrue(
-            self.analyzer.should_record_eth_price(2015, 40200)
-        )  # Низкая корреляция
-        # Проверяем, что запись не происходит при высокой корреляции
-        self.analyzer.add_price(2040, 41000)
-        self.assertFalse(
-            self.analyzer.should_record_eth_price(2030, 41050)
-        )  # Высокая корреляция
+        # Проверяем, что корреляция возвращается и больше 0
+        self.assertIsNotNone(correlation)
+        self.assertGreater(correlation, 0)
+
+    @patch('app.price_analyzer.datetime')
+    def test_calculate_adjusted_eth_prices(self, mock_datetime):
+        # Настраиваем mock для получения данных
+        mock_datetime.now.return_value = mock_datetime(2023, 10, 1, 12, 0, 0)
+        mock_datetime.timedelta = timedelta
+
+        # Поддельные данные для ETH и BTC
+        self.db_manager.get_session.return_value.query.return_value.filter.return_value.all.side_effect = [
+            [Price(timestamp=mock_datetime(2023, 10, 1, 11, 59, 0), price=3000.0),
+             Price(timestamp=mock_datetime(2023, 10, 1, 12, 0, 0), price=3050.0)],
+            [Price(timestamp=mock_datetime(2023, 10, 1, 11, 59, 0), price=45000.0),
+             Price(timestamp=mock_datetime(2023, 10, 1, 12, 0, 0), price=45500.0)]
+        ]
+
+        # Устанавливаем корреляцию для теста
+        self.eth_price_analyzer.analyze_price_influence = MagicMock(return_value=0.8)
+
+        adjusted_prices = self.eth_price_analyzer.calculate_adjusted_eth_prices(eth_symbol='ETHUSDT',
+                                                                                btc_symbol='BTCUSDT',
+                                                                                lookback_period=10)
+
+        # Проверяем, что скорректированные цены возвращаются и не пустые
+        self.assertTrue(len(adjusted_prices) > 0)
+
+        # Проверяем, что обновление цен произошло
+        self.db_manager.get_session.return_value.commit.assert_called_once()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
