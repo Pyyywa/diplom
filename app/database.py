@@ -40,7 +40,11 @@ def clear_old_prices(session) -> None:
     """Очистка таблицы цен, если данные старше одного часа."""
     try:
         threshold_time = datetime.now() - timedelta(hours=1)
-        deleted_count = session.query(Price).filter(Price.timestamp < threshold_time).delete(synchronize_session=False)
+        deleted_count = (
+            session.query(Price)
+            .filter(Price.timestamp < threshold_time)
+            .delete(synchronize_session=False)
+        )
         session.commit()
         logging.info(f"Удалено {deleted_count} старых цен из базы данных.")
     except Exception as e:
@@ -61,4 +65,6 @@ def check_price_changes(session) -> None:
     if min_price > 0:
         price_change_percentage = ((max_price - min_price) / min_price) * 100
         if price_change_percentage > 1:
-            logging.info(f"Изменение за последний час превышает 1%: цена изменилась на {price_change_percentage:.2f}%")
+            logging.info(
+                f"Изменение за последний час превышает 1%: цена изменилась на {price_change_percentage:.2f}%"
+            )
